@@ -10,6 +10,13 @@ import logging
 from stardis.model.geometry.radial1d import Radial1DGeometry
 from stardis.model.base import StellarModel
 from tardis.model.matter.composition import Composition
+from stardis.io.model.marcs_regex_patterns import (
+    METADATA_PLANE_PARALLEL_RE_STR,
+    METADATA_SPHERICAL_RE_STR,
+)
+from stardis.io.model.util import create_scaled_solar_profile
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +29,7 @@ class MARCSModel(object):
 
     metadata: dict
     data: pd.DataFrame
+    spherical: bool
 
     def to_geometry(self):
         """
@@ -31,12 +39,24 @@ class MARCSModel(object):
         -------
         stardis.model.geometry.radial1d.Radial1DGeometry
         """
+
+        reference_r = None
         r = (
             -self.data.depth.values[::-1] * u.cm
         )  # Flip data to move from innermost stellar point to surface
-        return Radial1DGeometry(r)
+        if self.spherical:
+            r += self.metadata["radius"]
+            reference_r = self.metadata["radius"]
+        return Radial1DGeometry(r, reference_r)
 
-    def to_composition(self, atom_data, final_atomic_number):
+    def to_composition(
+        self,
+        atom_data,
+        final_atomic_number,
+        composition_source,
+        helium_mass_frac_Y,
+        heavy_metal_mass_frac_Z,
+    ):
         """
         Returns a stardis.model.composition.base.Composition object from the MARCS model.
 
@@ -45,21 +65,50 @@ class MARCSModel(object):
         atom_data : tardis.io.atom_data.base.AtomData
         final_atomic_number : int, optional
             Atomic number for the final element included in the model.
+        composition_source : str, optional
+            Choice of base composition source. Default is "from_model" and will read from the marcs model.
+            Options are: "from_model", "asplund2009".
+        helium_mass_frac_Y : float, optional
+            Helium mass fraction when not reading composition from model.
+        heavy_metal_mass_frac_Z : float, optional
+            Heavy element mass fraction when not reading composition from model.
 
         Returns
         ----------
-        stardis.model.composition.base.Composition
+        tardis.model.matter.composition.Composition
         """
         density = (
             self.data.density.values[::-1] * u.g / u.cm**3
         )  # Flip data to move from innermost stellar point to surface
-        atomic_mass_fraction = self.convert_marcs_raw_abundances_to_mass_fractions(
-            atom_data, final_atomic_number
-        )
+        if composition_source == "from_model":
+            atomic_mass_fraction = self.convert_marcs_raw_abundances_to_mass_fractions(
+                atom_data, final_atomic_number
+            )
+        elif (
+            composition_source == "asplund_2009" or composition_source == "asplund_2020"
+        ):
+            solar_profile = create_scaled_solar_profile(
+                atom_data,
+                helium_mass_frac_Y=helium_mass_frac_Y,
+                heavy_metal_mass_frac_Z=heavy_metal_mass_frac_Z,
+                final_atomic_number=np.min(
+                    [final_atomic_number, len(atom_data.atom_data)]
+                ),
+                composition_source=composition_source,
+            )
+            atomic_mass_fraction = pd.DataFrame(
+                columns=range(len(self.data)),
+                index=solar_profile.index,
+                data=np.repeat(solar_profile.values, len(self.data), axis=1),
+            )
+        else:
+            raise ValueError(
+                f"Unknown composition {composition_source} requested. composition_source must be 'from_model', 'asplund_2020', or 'asplund_2009'."
+            )
 
         atomic_mass_fraction["mass_number"] = -1
         atomic_mass_fraction.set_index("mass_number", append=True, inplace=True)
-
+        atomic_mass_fraction.index.name = "atomic_number"
         return Composition(
             density,
             atomic_mass_fraction,
@@ -121,7 +170,14 @@ class MARCSModel(object):
 
         return marcs_atom_data
 
-    def to_stellar_model(self, atom_data, final_atomic_number=118):
+    def to_stellar_model(
+        self,
+        atom_data,
+        final_atomic_number,
+        composition_source,
+        helium_mass_frac_Y=None,
+        heavy_metal_mass_frac_Z=None,
+    ):
         """
         Produces a stellar model readable by stardis.
 
@@ -138,7 +194,11 @@ class MARCSModel(object):
         """
         marcs_geometry = self.to_geometry()
         marcs_composition = self.to_composition(
-            atom_data=atom_data, final_atomic_number=final_atomic_number
+            atom_data=atom_data,
+            final_atomic_number=final_atomic_number,
+            composition_source=composition_source,
+            helium_mass_frac_Y=helium_mass_frac_Y,
+            heavy_metal_mass_frac_Z=heavy_metal_mass_frac_Z,
         )
         temperatures = (
             self.data.t.values[::-1] * u.K
@@ -147,6 +207,7 @@ class MARCSModel(object):
             temperatures,
             marcs_geometry,
             marcs_composition,
+            spherical=self.spherical,
             microturbulence=self.metadata["microturbulence"],
         )
 
@@ -163,63 +224,15 @@ def read_marcs_metadata(fpath, gzipped=True):
             Path to model file
     gzipped : Bool
             Whether or not the file is gzipped
+    spherical : Bool
+            Whether or not the model is spherical
 
     Returns
     -------
     dict : dictionary
             metadata parameters of file
     """
-
-    METADATA_RE_STR = [
-        (r"(.+)\n", "fname"),
-        (
-            r"  (\d+\.)\s+Teff \[(.+)\]\.\s+Last iteration; yyyymmdd=\d+",
-            "teff",
-            "teff_units",
-        ),
-        (r"  (\d+\.\d+E\+\d+) Flux \[(.+)\]", "flux", "flux_units"),
-        (
-            r"  (\d+.\d+E\+\d+) Surface gravity \[(.+)\]",
-            "surface_grav",
-            "surface_grav_units",
-        ),
-        (
-            r"  (\d+\.\d+)\W+Microturbulence parameter \[(.+)\]",
-            "microturbulence",
-            "microturbulence_units",
-        ),
-        (r"  (\d+\.\d+)\s+(No mass for plane-parallel models)", "plane_parallel_mass"),
-        (
-            r" (\+?\-?\d+.\d+) (\+?\-?\d+.\d+) Metallicity \[Fe\/H] and \[alpha\/Fe\]",
-            "feh",
-            "afe",
-        ),
-        (
-            r"  (\d+\.\d+E\+00) (1 cm radius for plane-parallel models)",
-            "radius for plane-parallel model",
-        ),
-        (r"  (\d.\d+E-\d+) Luminosity \[(.+)\]", "luminosity", "luminosity_units"),
-        (
-            r"  (\d+.\d+) (\d+.\d+) (\d+.\d+) (\d+.\d+) are the convection parameters: alpha, nu, y and beta",
-            "conv_alpha",
-            "conv_nu",
-            "conv_y",
-            "conv_beta",
-        ),
-        (
-            r"  (0.\d+) (0.\d+) (\d.\d+E-\d+) are X, Y and Z, 12C\/13C=(\d+.?\d+)",
-            "x",
-            "y",
-            "z",
-            "12C/13C",
-        ),
-    ]
     BYTES_THROUGH_METADATA = 550
-
-    # Compile each of the regex pattern strings then open the file and match each of the patterns by line.
-    # Then add each of the matched patterns as a key:value pair to the metadata dict.
-    metadata_re = [re.compile(re_str[0]) for re_str in METADATA_RE_STR]
-    metadata = {}
 
     if gzipped:
         with gzip.open(fpath, "rt") as file:
@@ -231,10 +244,29 @@ def read_marcs_metadata(fpath, gzipped=True):
 
     lines = list(contents)
 
-    for i, line in enumerate(lines):
-        metadata_re_match = metadata_re[i].match(line)
+    # Compile each of the regex pattern strings then open the file and match each of the patterns by line.
+    # Then add each of the matched patterns as a key:value pair to the metadata dict.
+    # Files are formatted a little differently depending on if the MARCS model is spherical or plane-parallel
+    if "plane-parallel" in lines[5]:
+        logger.info("Plane-parallel model detected.")
+        spherical = False
+        metadata_re = [
+            re.compile(re_str[0]) for re_str in METADATA_PLANE_PARALLEL_RE_STR
+        ]
+        metadata_re_str = METADATA_PLANE_PARALLEL_RE_STR
+    else:
+        logger.info("Spherical model detected.")
+        spherical = True
+        metadata_re = [re.compile(re_str[0]) for re_str in METADATA_SPHERICAL_RE_STR]
+        metadata_re_str = METADATA_SPHERICAL_RE_STR
 
-        for j, metadata_name in enumerate(METADATA_RE_STR[i][1:]):
+    metadata = {}
+
+    # Check each line against the regex patterns and add the matched values to the metadata dictionary
+    for i in range(len(metadata_re_str)):
+        line = lines[i]
+        metadata_re_match = metadata_re[i].match(line)
+        for j, metadata_name in enumerate(metadata_re_str[i][1:]):
             metadata[metadata_name] = metadata_re_match.group(j + 1)
 
     # clean up metadata dictionary by changing strings of numbers to floats and attaching parsed units where appropriate
@@ -248,7 +280,7 @@ def read_marcs_metadata(fpath, gzipped=True):
             metadata[key] = float(metadata[key])
     metadata = {key: metadata[key] for key in metadata if key not in keys_to_remove}
 
-    return metadata
+    return metadata, spherical
 
 
 def read_marcs_data(fpath, gzipped=True):
@@ -328,13 +360,20 @@ def read_marcs_model(fpath, gzipped=True):
             Path to model file
     gzipped : Bool
             Whether or not the file is gzipped
+    spherical : Bool
+            Whether or not the model is spherical
 
     Returns
     -------
     model : MARCSModel
         Assembled metadata and data pair of a MARCS model
     """
-    metadata = read_marcs_metadata(fpath, gzipped=gzipped)
+    try:
+        metadata, spherical = read_marcs_metadata(fpath, gzipped=gzipped)
+    except:
+        raise ValueError(
+            "Failed to read metadata from MARCS model file. Make sure that you are specifying if the file is gzipped appropriately."
+        )
     data = read_marcs_data(fpath, gzipped=gzipped)
 
-    return MARCSModel(metadata, data)
+    return MARCSModel(metadata, data, spherical=spherical)

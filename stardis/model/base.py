@@ -1,4 +1,5 @@
 from tardis.io.util import HDFWriterMixin
+from astropy import units as u
 
 
 class StellarModel(HDFWriterMixin):
@@ -21,16 +22,26 @@ class StellarModel(HDFWriterMixin):
         Composition of the model. Includes density and atomic mass fractions.
     no_of_depth_points : int
         Class attribute to be easily accessible for initializing arrays that need to match the shape of the model.
-    microturbulence : float
+    spherical : bool
+        Flag for spherical geometry.
+    microturbulence : astropy.units.Quantity
         Microturbulence in km/s.
     """
 
     hdf_properties = ["temperatures", "geometry", "composition"]
 
-    def __init__(self, temperatures, geometry, composition, microturbulence=0.0):
+    def __init__(
+        self,
+        temperatures,
+        geometry,
+        composition,
+        spherical=False,
+        microturbulence=0.0 * u.km / u.s,
+    ):
         self.temperatures = temperatures
         self.geometry = geometry
         self.composition = composition
+        self.spherical = spherical
         self.microturbulence = microturbulence
 
     @property
