@@ -49,6 +49,14 @@ jobs:
         run: jupyter nbconvert stardis_gather_data.ipynb --to html --execute --ExecutePreprocessor.timeout=6000 --allow-errors
         if: failure()
 
+      - name: Debug - List files in workspace
+        run: |
+            echo "Listing files in current directory:"
+            ls -la
+            echo "Searching for .zenodo.json in subdirectories:"
+            find . -name ".zenodo.json"
+        if: always()
+
       - uses: actions/upload-artifact@v4
         with:
           name: zenodo_json
@@ -71,7 +79,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: zenodo_json
-          path: . 
+          path: .
 
       - name: Display .zenodo.json
         run: cat .zenodo.json
