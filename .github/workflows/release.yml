@@ -37,11 +37,6 @@ jobs:
             cache-environment: true
             cache-downloads: true
 
-      - name: Dump Secret Key
-        run: echo "$KEY_SECRET_JSON" > key_secret.json
-        env:
-          KEY_SECRET_JSON: ${{ secrets.ZENODO_KEY_SECRET_JSON }}
-
       - name: Run Notebook
         run: jupyter nbconvert stardis_gather_data.ipynb --to html --execute --ExecutePreprocessor.timeout=6000
 
